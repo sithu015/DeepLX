@@ -195,7 +195,9 @@ func resolveTargetLang(code string) (string, error) {
 	if v, ok := targetLangMap[strings.ToUpper(code)]; ok {
 		return v, nil
 	}
-	return "", fmt.Errorf("unsupported target_lang %q; valid codes: %s", code, supportedTargetLangsList())
+	// Pass through unknown language codes directly (e.g. MY for Burmese)
+	// DeepL's oneshot API may support languages not in this map
+	return strings.ToLower(code), nil
 }
 
 // resolveSourceLang validates and normalizes a user-supplied source
