@@ -25,9 +25,16 @@
 
 ## How to use
 
-> \[!TIP]
->
+> [!TIP]
 > Learn more about [📘 Using DeepLX](https://deeplx.owo.network) by checking it out.
+
+### Project Documentation (Diátaxis Framework)
+To get started with local development, deployment, or configuration, check out our comprehensive documentation:
+- 🚀 **[Tutorial / Quick Start](docs/TUTORIAL.md)**: Guide on how to compile, run locally, or deploy with Docker.
+- 🛠️ **[How-to Guides](docs/HOW_TO.md)**: Common recipes (e.g. setting proxy rotation, configuring access tokens, systemd services).
+- 📖 **[API & CLI Reference](docs/REFERENCE.md)**: Comprehensive CLI arguments, environment variable lists, and API payload schemas.
+- 🧠 **[System Architecture Explanation](docs/EXPLANATION.md)**: Deep-dive explanation on the client connection pooling, memory optimizations, and security designs.
+- 🤖 **[AI Code Agent Context (llm.txt)](llm.txt)**: Token-efficient, dense specification file describing system design, architecture, and API details specifically structured for LLM/AI agents.
 
 ## Discussion Group
 [Telegram Group](https://t.me/+8KDGHKJCxEVkNzll)

@@ -1,0 +1,147 @@
+# DeepLX: DeepL Free Translation API Server
+
+DeepLX is an open-source, stateless API proxy server written in Go that reverse-engineers the official DeepL Chrome Extension's stateless "oneshot" endpoints (`oneshot-free.www.deepl.com` and `oneshot-pro.www.deepl.com`) to provide unlimited translation services.
+
+## System Architecture
+
+DeepLX is structured into three main layers:
+1. **Entry Point** (`main.go`): Initializes the configuration, sets release mode, and starts the Gin HTTP server.
+2. **Service Layer** (`service/`):
+   - `config.go`: Parses configuration from environment variables and CLI flags with proper validation.
+   - `service.go`: Sets up routes, authentication middleware, CORS, and binds incoming requests.
+3. **Translation Core** (`translate/`):
+   - `translate.go`: Normalizes language codes, manages an optimized HTTP client pool with proxy isolation and cookie-warming, builds JSON payloads without reflection, pools decompressors to prevent memory leaks, and talks to DeepL's endpoints.
+   - `types.go`: Response data structures.
+
+```mermaid
+graph TD
+    Client -->|HTTP POST| Service[service/service.go]
+    Service -->|Auth Middleware| Service
+    Service -->|TranslateRequest| Core[translate/translate.go]
+    Core -->|Get Isolated Client| Pool[HTTP Client Pool]
+    Core -->|Buffered JSON Payload| DeepL[DeepL oneshot API]
+    DeepL -->|Encrypted Response| Core
+    Core -->|Pooled Decompressor| Core
+    Core -->|TranslateResponse| Service
+    Service -->|JSON Response| Client
+```
+
+---
+
+## Code Base Map
+
+- `main.go`: Application entrypoint.
+- `service/config.go`: CLI flags & environment variables parser with `[1, 65535]` port range validation.
+- `service/service.go`: Routes configuration and timing-attack-safe Token validation middleware.
+- `translate/types.go`: Struct definitions for translation response outputs.
+- `translate/translate.go`: Downstream core client logic, decompression pools, and memory optimizations.
+- `translate/translate_test.go`: Unit tests for character limit validation checks.
+- `Dockerfile`: Minimal multi-stage Docker build config featuring Go 1.25.0 and `ca-certificates`.
+- `install.sh` / `uninstall.sh`: Unprivileged systemd service installer/uninstaller scripts.
+- `deeplx.service`: Systemd service descriptor utilizing user privilege isolation.
+
+---
+
+## Configuration Reference
+
+Configurations can be set via environment variables or CLI flags (CLI flags override environment variables).
+
+| Environment | CLI Flag | Default | Description |
+| :--- | :--- | :--- | :--- |
+| `IP` | `-ip`, `-i` | `0.0.0.0` | IP address to bind to |
+| `PORT` | `-port`, `-p` | `1188` | Port to listen on (Must be `1-65535`) |
+| `TOKEN` | `-token` | `""` | Optional access token required to access translation endpoints |
+| `DL_SESSION` | `-s` | `""` | Optional session token required to hit Pro endpoint (`/v1/translate`) |
+| `PROXY` | `-proxy` | `""` | Optional outbound HTTP proxy URL |
+
+---
+
+## API Endpoints
+
+### 1. GET `/`
+Returns project details and metadata.
+- **Response**: `200 OK`
+  ```json
+  {
+    "code": 200,
+    "message": "DeepL Free API, Developed by sjlleo and missuo. Go to /translate with POST. http://github.com/OwO-Network/DeepLX"
+  }
+  ```
+
+---
+
+### 2. POST `/translate`
+Free-tier translation endpoint. Requires `Authorization` header if `TOKEN` is set.
+- **Fingerprint Limit**: Maximum 1500 characters.
+- **Request Headers**:
+  - `Content-Type: application/json`
+  - `Authorization: Bearer <TOKEN>` (Optional)
+- **Request Body**:
+  ```json
+  {
+    "text": "Hello World",
+    "source_lang": "EN",
+    "target_lang": "DE",
+    "tag_handling": "html"
+  }
+  ```
+  *(Note: `source_lang` defaults to "auto" if empty or omitted. `tag_handling` can be empty, `"html"`, or `"xml"`).*
+- **Response**: `200 OK`
+  ```json
+  {
+    "code": 200,
+    "id": 1717320000000,
+    "data": "Hallo Welt",
+    "alternatives": null,
+    "source_lang": "EN",
+    "target_lang": "DE",
+    "method": "Free"
+  }
+  ```
+
+---
+
+### 3. POST `/v1/translate`
+Pro-tier translation endpoint. Requires valid DeepL OAuth Pro access token (`dl_session`).
+- **Fingerprint Limit**: Unlimited.
+- **Request Headers**:
+  - `Content-Type: application/json`
+  - `Authorization: Bearer <TOKEN>` (Optional, if DeepLX proxy auth token is set)
+  - `Cookie: dl_session=<PRO_OAUTH_TOKEN>` (Alternatively passes session token via cookies)
+- **Request Body**: Same as `/translate`.
+- **Response**: Same as `/translate` with `method: "Pro"`.
+
+---
+
+### 4. POST `/v2/translate`
+Standard DeepL official API compatible endpoint.
+- **Request Headers**:
+  - `Content-Type: application/json` or `application/x-www-form-urlencoded`
+  - `Authorization: Bearer <TOKEN>` (Optional)
+- **Request Body** (JSON or Form URL Encoded):
+  ```json
+  {
+    "text": ["Hello World"],
+    "target_lang": "DE"
+  }
+  ```
+- **Response**: `200 OK`
+  ```json
+  {
+    "translations": [
+      {
+        "detected_source_language": "EN",
+        "text": "Hallo Welt"
+      }
+    ]
+  }
+  ```
+
+---
+
+## AI Agent Integration Tips
+
+1. **Context Cancellation**: Ensure the caller propagates HTTP request contexts to downstream endpoints. If client cuts connection, DeepLX terminates its outbound DeepL request immediately.
+2. **Proxy Isolation**: DeepLX handles proxy caching via `sync.Map` and creates individual `http.CookieJar` instances per proxy. If you need proxy rotation, pass the specific proxy configuration dynamically or scale via upstream proxy-rotation pools.
+3. **Token Validation**: The server uses SHA-256 validation in `subtle.ConstantTimeCompare`, so timing attacks cannot leak token length.
+4. **Header Fingerprinting**: outbound client requests simulate the Chrome 120 client TLS Hello and exact HTTP/2 headers to minimize WAF blocks.

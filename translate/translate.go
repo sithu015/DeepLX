@@ -13,6 +13,7 @@
 package translate
 
 import (
+	"bytes"
 	"compress/flate"
 	"compress/gzip"
 	"context"
@@ -87,48 +88,23 @@ const (
 // Rotating it per-request would be a far stronger signal than reusing one.
 var instanceID = newInstanceID()
 
-// A real extension fetch() inherits whatever cookies the browser has
-// accumulated on .deepl.com. A cold visit to www.deepl.com sets
-// userCountry=<iso2> and verifiedBot=false; users who have ever opened
-// the site additionally have _ga / _ga_<id> from analytics JS. We share
-// a process-wide cookie jar so every oneshot POST automatically carries
-// whatever the warmup GET picked up.
+type clientWrapper struct {
+	client *req.Client
+	warmer sync.Once
+}
+
 var (
-	cookieJar     http.CookieJar
-	cookieJarOnce sync.Once
-	cookieWarmer  sync.Once
+	oneshotClients   sync.Map // map[string]*clientWrapper
+	clientMu         sync.Mutex
+	bufPool          = sync.Pool{
+		New: func() interface{} {
+			return new(bytes.Buffer)
+		},
+	}
+	gzipReaderPool   sync.Pool
+	flateReaderPool  sync.Pool
+	brotliReaderPool sync.Pool
 )
-
-// oneshotClients caches one req.Client per proxy URL so all translate
-// calls share the underlying TCP / TLS / HTTP/2 connection pool.
-// Creating a fresh req.Client per request meant a brand-new TLS
-// handshake every time (~200-400ms of overhead on top of DeepL's own
-// ~1.5s processing latency). Reusing the client lets keep-alive +
-// session tickets cut that to near zero on the warm path.
-var oneshotClients sync.Map // map[string]*req.Client
-
-func sharedCookieJar() http.CookieJar {
-	cookieJarOnce.Do(func() {
-		j, _ := cookiejar.New(nil)
-		cookieJar = j
-	})
-	return cookieJar
-}
-
-// warmCookies primes the shared jar by GETting www.deepl.com once.
-// The Set-Cookie response (userCountry / verifiedBot) lands on .deepl.com,
-// which is the eTLD+1 of oneshot-free.www.deepl.com, so subsequent POSTs
-// to the oneshot endpoint will carry those cookies automatically. The
-// same request doubles as a TLS-handshake warmup: it leaves a live
-// HTTP/2 connection to www.deepl.com in the client pool, which the
-// first oneshot POST then resumes via TLS session tickets.
-func warmCookies(client *req.Client) {
-	cookieWarmer.Do(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), warmupTimeout)
-		defer cancel()
-		_, _ = client.R().SetContext(ctx).Get("https://www.deepl.com/translator")
-	})
-}
 
 func newInstanceID() string {
 	b := make([]byte, 16)
@@ -285,25 +261,42 @@ type oneshotRequest struct {
 // in the background on first creation so that the first real translate
 // call lands on an already-established connection.
 func getOneshotClient(proxyURL string) (*req.Client, error) {
-	if c, ok := oneshotClients.Load(proxyURL); ok {
-		return c.(*req.Client), nil
+	if val, ok := oneshotClients.Load(proxyURL); ok {
+		return val.(*clientWrapper).client, nil
 	}
+
+	clientMu.Lock()
+	defer clientMu.Unlock()
+
+	if val, ok := oneshotClients.Load(proxyURL); ok {
+		return val.(*clientWrapper).client, nil
+	}
+
 	c, err := newOneshotClient(proxyURL)
 	if err != nil {
 		return nil, err
 	}
-	if actual, loaded := oneshotClients.LoadOrStore(proxyURL, c); loaded {
-		return actual.(*req.Client), nil
+
+	wrapper := &clientWrapper{
+		client: c,
 	}
-	// First time we've seen this proxy. Kick warmup off in the
-	// background so the very first translate call can run in parallel
-	// with the TLS handshake to www.deepl.com.
-	go warmCookies(c)
+
+	oneshotClients.Store(proxyURL, wrapper)
+
+	go func() {
+		wrapper.warmer.Do(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), warmupTimeout)
+			defer cancel()
+			_, _ = wrapper.client.R().SetContext(ctx).Get("https://www.deepl.com/translator")
+		})
+	}()
+
 	return c, nil
 }
 
 func newOneshotClient(proxyURL string) (*req.Client, error) {
-	client := req.C().ImpersonateChrome().SetCookieJar(sharedCookieJar()).SetTimeout(oneshotTimeout)
+	jar, _ := cookiejar.New(nil)
+	client := req.C().ImpersonateChrome().SetCookieJar(jar).SetTimeout(oneshotTimeout)
 	for _, h := range []string{
 		"Pragma",
 		"Cache-Control",
@@ -332,7 +325,7 @@ func newOneshotClient(proxyURL string) (*req.Client, error) {
 // header `Authorization: None` — replicating the extension's JO() wrapper
 // exactly. Omitting that header instead would put the request on a
 // different server-side auth branch.
-func callOneshot(endpoint string, body []byte, bearerToken, proxyURL string) (gjson.Result, int, error) {
+func callOneshot(ctx context.Context, endpoint string, body []byte, bearerToken, proxyURL string) (gjson.Result, int, error) {
 	client, err := getOneshotClient(proxyURL)
 	if err != nil {
 		return gjson.Result{}, 0, err
@@ -344,6 +337,7 @@ func callOneshot(endpoint string, body []byte, bearerToken, proxyURL string) (gj
 	}
 
 	resp, err := client.R().
+		SetContext(ctx).
 		DisableAutoReadResponse().
 		SetHeader("Content-Type", "application/json").
 		SetHeader("Accept", "*/*").
@@ -366,16 +360,53 @@ func callOneshot(endpoint string, body []byte, bearerToken, proxyURL string) (gj
 	var reader io.Reader = resp.Body
 	switch strings.ToLower(resp.Header.Get("Content-Encoding")) {
 	case "gzip":
-		gr, err := gzip.NewReader(resp.Body)
-		if err != nil {
-			return gjson.Result{}, resp.StatusCode, fmt.Errorf("gzip reader: %w", err)
+		var gr *gzip.Reader
+		if v := gzipReaderPool.Get(); v != nil {
+			gr = v.(*gzip.Reader)
+			if err := gr.Reset(resp.Body); err != nil {
+				return gjson.Result{}, resp.StatusCode, fmt.Errorf("gzip reset: %w", err)
+			}
+		} else {
+			var err error
+			gr, err = gzip.NewReader(resp.Body)
+			if err != nil {
+				return gjson.Result{}, resp.StatusCode, fmt.Errorf("gzip reader: %w", err)
+			}
 		}
-		defer gr.Close()
+		defer func() {
+			gr.Close()
+			gzipReaderPool.Put(gr)
+		}()
 		reader = gr
 	case "deflate":
-		reader = flate.NewReader(resp.Body)
+		var fr io.ReadCloser
+		if v := flateReaderPool.Get(); v != nil {
+			fr = v.(io.ReadCloser)
+			if err := fr.(flate.Resetter).Reset(resp.Body, nil); err != nil {
+				return gjson.Result{}, resp.StatusCode, fmt.Errorf("flate reset: %w", err)
+			}
+		} else {
+			fr = flate.NewReader(resp.Body)
+		}
+		defer func() {
+			fr.Close()
+			flateReaderPool.Put(fr)
+		}()
+		reader = fr
 	case "br":
-		reader = brotli.NewReader(resp.Body)
+		var br *brotli.Reader
+		if v := brotliReaderPool.Get(); v != nil {
+			br = v.(*brotli.Reader)
+			if err := br.Reset(resp.Body); err != nil {
+				return gjson.Result{}, resp.StatusCode, fmt.Errorf("brotli reset: %w", err)
+			}
+		} else {
+			br = brotli.NewReader(resp.Body)
+		}
+		defer func() {
+			brotliReaderPool.Put(br)
+		}()
+		reader = br
 	}
 	raw, err := io.ReadAll(reader)
 	if err != nil {
@@ -388,7 +419,7 @@ func callOneshot(endpoint string, body []byte, bearerToken, proxyURL string) (gj
 // Passing dlSession switches to the Pro endpoint; the value is sent
 // verbatim as the Bearer token (i.e. it must be an OAuth access token,
 // not the legacy dl_session cookie).
-func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, proxyURL string, dlSession string) (DeepLXTranslationResult, error) {
+func TranslateByDeepLX(ctx context.Context, sourceLang, targetLang, text string, tagHandling string, proxyURL string, dlSession string) (DeepLXTranslationResult, error) {
 	if text == "" {
 		return DeepLXTranslationResult{
 			Code:    http.StatusNotFound,
@@ -411,27 +442,42 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 		}, nil
 	}
 
-	if n := utf8.RuneCountInString(text); n > maxFreeTextLength {
-		return DeepLXTranslationResult{
-			Code:    http.StatusRequestEntityTooLarge,
-			Message: fmt.Sprintf("text exceeds maximum length: %d characters (anonymous oneshot limit is %d)", n, maxFreeTextLength),
-		}, nil
+	if dlSession == "" {
+		if n := utf8.RuneCountInString(text); n > maxFreeTextLength {
+			return DeepLXTranslationResult{
+				Code:    http.StatusRequestEntityTooLarge,
+				Message: fmt.Sprintf("text exceeds maximum length: %d characters (anonymous oneshot limit is %d)", n, maxFreeTextLength),
+			}, nil
+		}
 	}
 
-	reqStruct := oneshotRequest{
-		Text:       []string{text},
-		TargetLang: resolvedTarget,
-		SourceLang: resolvedSource, // empty = autodetect; omitempty drops the field
-		UsageType:  "Translate",
-		AppInformation: appInformation{
-			OS:         "brex_macOS",
-			OSVersion:  "brex_chrome_" + impersonatedChromeMajor + ".0.0.0",
-			AppVersion: chromeExtensionVersion,
-			AppBuild:   "chrome_web_store",
-			InstanceID: instanceID,
-		},
+	textBytes, err := json.Marshal(text)
+	if err != nil {
+		return DeepLXTranslationResult{}, err
 	}
-	bodyBytes, _ := json.Marshal(reqStruct)
+	buf := bufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	defer bufPool.Put(buf)
+
+	buf.WriteString(`{"text":[`)
+	buf.Write(textBytes)
+	buf.WriteString(`],"target_lang":"`)
+	buf.WriteString(resolvedTarget)
+	buf.WriteString(`"`)
+	if resolvedSource != "" {
+		buf.WriteString(`,"source_lang":"`)
+		buf.WriteString(resolvedSource)
+		buf.WriteString(`"`)
+	}
+	buf.WriteString(`,"usage_type":"Translate","app_information":{`)
+	buf.WriteString(`"os":"brex_macOS",`)
+	buf.WriteString(`"os_version":"brex_chrome_` + impersonatedChromeMajor + `.0.0.0",`)
+	buf.WriteString(`"app_version":"` + chromeExtensionVersion + `",`)
+	buf.WriteString(`"app_build":"chrome_web_store",`)
+	buf.WriteString(`"instance_id":"` + instanceID + `"`)
+	buf.WriteString(`}}`)
+
+	bodyBytes := buf.Bytes()
 
 	endpoint := oneshotFreeEndpoint
 	if dlSession != "" {
@@ -439,7 +485,7 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 	}
 
 	id := time.Now().UnixMilli()
-	result, status, err := callOneshot(endpoint, bodyBytes, dlSession, proxyURL)
+	result, status, err := callOneshot(ctx, endpoint, bodyBytes, dlSession, proxyURL)
 	if err != nil {
 		// Map upstream timeouts to 504 so callers can distinguish "DeepL
 		// took too long" from other 503 failure modes (DNS, TLS, etc.).
@@ -470,7 +516,7 @@ func TranslateByDeepLX(sourceLang, targetLang, text string, tagHandling string, 
 	default:
 		return DeepLXTranslationResult{
 			ID:      id,
-			Code:    http.StatusServiceUnavailable,
+			Code:    status,
 			Message: fmt.Sprintf("request failed with status code: %d", status),
 		}, nil
 	}

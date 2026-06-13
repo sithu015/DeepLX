@@ -13,12 +13,11 @@
 package service
 
 import (
+	"crypto/sha256"
 	"crypto/subtle"
 	"fmt"
 	"log"
 	"net/http"
-	"net/url"
-	"os"
 	"strings"
 
 	"github.com/gin-contrib/cors"
@@ -49,10 +48,9 @@ func authMiddleware(cfg *Config) gin.HandlerFunc {
 			}
 
 			// Security fix: use constant-time comparison to prevent timing side-channel attacks
-			tokenMatch := subtle.ConstantTimeCompare(
-				[]byte(providedToken),
-				[]byte(cfg.Token),
-			) == 1
+			hProvided := sha256.Sum256([]byte(providedToken))
+			hConfigured := sha256.Sum256([]byte(cfg.Token))
+			tokenMatch := subtle.ConstantTimeCompare(hProvided[:], hConfigured[:]) == 1
 
 			if !tokenMatch {
 				c.JSON(http.StatusUnauthorized, gin.H{
@@ -83,20 +81,8 @@ type PayloadAPI struct {
 }
 
 func Router(cfg *Config) *gin.Engine {
-	// Resolve proxy URL: env var takes precedence over config file
-	proxyURL := os.Getenv("PROXY")
-	if proxyURL == "" {
-		proxyURL = cfg.Proxy
-	}
-	if proxyURL != "" {
-		proxy, err := url.Parse(proxyURL)
-		if err != nil {
-			log.Fatalf("Failed to parse proxy URL: %v", err)
-		}
-		http.DefaultTransport = &http.Transport{
-			Proxy: http.ProxyURL(proxy),
-		}
-	}
+	proxyURL := cfg.Proxy
+
 
 	if cfg.Token != "" {
 		fmt.Println("Access token is set.")
@@ -140,7 +126,7 @@ func Router(cfg *Config) *gin.Engine {
 			return
 		}
 
-		result, err := translate.TranslateByDeepLX(sourceLang, targetLang, translateText, tagHandling, proxyURL, "")
+		result, err := translate.TranslateByDeepLX(c.Request.Context(), sourceLang, targetLang, translateText, tagHandling, proxyURL, "")
 		if err != nil {
 			log.Printf("Translation failed: %s", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -215,7 +201,7 @@ func Router(cfg *Config) *gin.Engine {
 		// The Pro endpoint naturally requires a valid token — DeepL's server
 		// will return 401 if the token is not a genuine Pro OAuth token.
 
-		result, err := translate.TranslateByDeepLX(sourceLang, targetLang, translateText, tagHandling, proxyURL, dlSession)
+		result, err := translate.TranslateByDeepLX(c.Request.Context(), sourceLang, targetLang, translateText, tagHandling, proxyURL, dlSession)
 		if err != nil {
 			log.Printf("Translation failed: %s", err)
 			c.JSON(http.StatusInternalServerError, gin.H{
@@ -273,7 +259,7 @@ func Router(cfg *Config) *gin.Engine {
 			targetLang = jsonData.TargetLang
 		}
 
-		result, err := translate.TranslateByDeepLX("", targetLang, translateText, "", proxyURL, "")
+		result, err := translate.TranslateByDeepLX(c.Request.Context(), "", targetLang, translateText, "", proxyURL, "")
 		if err != nil {
 			log.Printf("Translation failed: %s", err)
 			c.JSON(http.StatusInternalServerError, gin.H{

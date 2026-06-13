@@ -1,3 +1,9 @@
+# Check for root privileges
+if [[ $EUID -ne 0 ]]; then
+    echo "This script must be run as root."
+    exit 1
+fi
+
 ###
  # @Author: Vincent Young
  # @Date: 2023-02-12 09:53:21
@@ -29,13 +35,17 @@ install_deeplx(){
             ;;
     esac
 
-    wget -q -N --no-check-certificate -O /usr/bin/deeplx https://github.com/OwO-Network/DeepLX/releases/download/${last_version}/deeplx_linux_${file_arch}
+    wget -q -N -O /usr/bin/deeplx https://github.com/OwO-Network/DeepLX/releases/download/${last_version}/deeplx_linux_${file_arch}
 
     chmod +x /usr/bin/deeplx
-    wget -q -N --no-check-certificate -O /etc/systemd/system/deeplx.service https://raw.githubusercontent.com/OwO-Network/DeepLX/main/deeplx.service
-    systemctl daemon-reload
-    systemctl enable deeplx
-    systemctl start deeplx
+    wget -q -N -O /etc/systemd/system/deeplx.service https://raw.githubusercontent.com/OwO-Network/DeepLX/main/deeplx.service
+    if pidof systemd >/dev/null; then
+        systemctl daemon-reload
+        systemctl enable deeplx
+        systemctl start deeplx
+    else
+        echo "systemd not detected. Please start the service manually using /usr/bin/deeplx."
+    fi
     echo -e "Installed successfully, listening at 0.0.0.0:1188"
 }
 install_deeplx

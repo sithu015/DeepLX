@@ -15,6 +15,7 @@ package service
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 )
 
@@ -41,35 +42,39 @@ func InitConfig() *Config {
 
 	// Port flag
 	if port, ok := os.LookupEnv("PORT"); ok && port != "" {
-		fmt.Sscanf(port, "%d", &cfg.Port)
+		if _, err := fmt.Sscanf(port, "%d", &cfg.Port); err != nil {
+			log.Printf("Warning: failed to parse PORT env var %q: %v. Using default %d", port, err, cfg.Port)
+		}
 	}
 	flag.IntVar(&cfg.Port, "port", cfg.Port, "set up the port to listen on")
 	flag.IntVar(&cfg.Port, "p", cfg.Port, "set up the port to listen on")
 
 	// DL Session flag
-	flag.StringVar(&cfg.DlSession, "s", "", "set the dl-session for /v1/translate endpoint")
-	if cfg.DlSession == "" {
-		if dlSession, ok := os.LookupEnv("DL_SESSION"); ok {
-			cfg.DlSession = dlSession
-		}
+	dlSession := ""
+	if envDlSession, ok := os.LookupEnv("DL_SESSION"); ok {
+		dlSession = envDlSession
 	}
+	flag.StringVar(&cfg.DlSession, "s", dlSession, "set the dl-session for /v1/translate endpoint")
 
 	// Access token flag
-	flag.StringVar(&cfg.Token, "token", "", "set the access token for /translate endpoint")
-	if cfg.Token == "" {
-		if token, ok := os.LookupEnv("TOKEN"); ok {
-			cfg.Token = token
-		}
+	token := ""
+	if envToken, ok := os.LookupEnv("TOKEN"); ok {
+		token = envToken
 	}
+	flag.StringVar(&cfg.Token, "token", token, "set the access token for /translate endpoint")
 
 	// HTTP Proxy flag
-	flag.StringVar(&cfg.Proxy, "proxy", "", "set the proxy URL for HTTP requests")
-	if cfg.Proxy == "" {
-		if proxy, ok := os.LookupEnv("PROXY"); ok {
-			cfg.Proxy = proxy
-		}
+	proxy := ""
+	if envProxy, ok := os.LookupEnv("PROXY"); ok {
+		proxy = envProxy
 	}
+	flag.StringVar(&cfg.Proxy, "proxy", proxy, "set the proxy URL for HTTP requests")
 
 	flag.Parse()
+
+	if cfg.Port < 1 || cfg.Port > 65535 {
+		log.Fatalf("Invalid port number: %d. Port must be between 1 and 65535.", cfg.Port)
+	}
+
 	return cfg
 }
