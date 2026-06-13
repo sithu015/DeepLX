@@ -58,6 +58,9 @@ func authMiddleware(cfg *Config) gin.HandlerFunc {
 				providedToken = c.Param("token")
 			}
 
+			// Clean up token: replace space with '+' because URL decoders sometimes convert '+' to space
+			providedToken = strings.ReplaceAll(providedToken, " ", "+")
+
 			// Security fix: use constant-time comparison to prevent timing side-channel attacks
 			hProvided := sha256.Sum256([]byte(providedToken))
 			hConfigured := sha256.Sum256([]byte(cfg.Token))
