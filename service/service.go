@@ -13,6 +13,7 @@
 package service
 
 import (
+	"crypto/subtle"
 	"fmt"
 	"log"
 	"net/http"
@@ -29,24 +30,31 @@ import (
 func authMiddleware(cfg *Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if cfg.Token != "" {
-			providedTokenInQuery := c.Query("token")
-			providedTokenInHeader := c.GetHeader("Authorization")
+			// Security fix: only accept token via Authorization header (not query string)
+			// Query string tokens are logged in plain text by proxies, CDNs, and web servers.
+			providedToken := c.GetHeader("Authorization")
 
-			// Compatability with the Bearer token format
-			if providedTokenInHeader != "" {
-				parts := strings.Split(providedTokenInHeader, " ")
+			// Compatibility with the Bearer token format
+			if providedToken != "" {
+				parts := strings.Split(providedToken, " ")
 				if len(parts) == 2 {
 					if parts[0] == "Bearer" || parts[0] == "DeepL-Auth-Key" {
-						providedTokenInHeader = parts[1]
+						providedToken = parts[1]
 					} else {
-						providedTokenInHeader = ""
+						providedToken = ""
 					}
 				} else {
-					providedTokenInHeader = ""
+					providedToken = ""
 				}
 			}
 
-			if providedTokenInHeader != cfg.Token && providedTokenInQuery != cfg.Token {
+			// Security fix: use constant-time comparison to prevent timing side-channel attacks
+			tokenMatch := subtle.ConstantTimeCompare(
+				[]byte(providedToken),
+				[]byte(cfg.Token),
+			) == 1
+
+			if !tokenMatch {
 				c.JSON(http.StatusUnauthorized, gin.H{
 					"code":    http.StatusUnauthorized,
 					"message": "Invalid access token",
@@ -75,7 +83,7 @@ type PayloadAPI struct {
 }
 
 func Router(cfg *Config) *gin.Engine {
-	// Set Proxy
+	// Resolve proxy URL: env var takes precedence over config file
 	proxyURL := os.Getenv("PROXY")
 	if proxyURL == "" {
 		proxyURL = cfg.Proxy
@@ -121,7 +129,8 @@ func Router(cfg *Config) *gin.Engine {
 		translateText := req.TransText
 		tagHandling := req.TagHandling
 
-		proxyURL := cfg.Proxy
+		// Bug fix: use the resolved proxyURL from outer Router scope
+		// (previously re-declared as cfg.Proxy, shadowing env-var proxy)
 
 		if tagHandling != "" && tagHandling != "html" && tagHandling != "xml" {
 			c.JSON(http.StatusBadRequest, gin.H{
@@ -175,7 +184,8 @@ func Router(cfg *Config) *gin.Engine {
 		targetLang := req.TargetLang
 		translateText := req.TransText
 		tagHandling := req.TagHandling
-		proxyURL := cfg.Proxy
+		// Bug fix: use the resolved proxyURL from outer Router scope
+		// (previously re-declared as cfg.Proxy, shadowing env-var proxy)
 
 		dlSession := cfg.DlSession
 
@@ -198,13 +208,12 @@ func Router(cfg *Config) *gin.Engine {
 				"message": "No dl_session Found",
 			})
 			return
-		} else if strings.Contains(dlSession, ".") {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"code":    http.StatusUnauthorized,
-				"message": "Your account is not a Pro account. Please upgrade your account or switch to a different account.",
-			})
-			return
 		}
+		// Bug fix: removed incorrect dot-check that blocked legitimate Pro OAuth JWT tokens.
+		// JWT/OAuth access tokens always contain dots (header.payload.signature),
+		// so the previous check rejected every valid Pro account token.
+		// The Pro endpoint naturally requires a valid token — DeepL's server
+		// will return 401 if the token is not a genuine Pro OAuth token.
 
 		result, err := translate.TranslateByDeepLX(sourceLang, targetLang, translateText, tagHandling, proxyURL, dlSession)
 		if err != nil {
@@ -237,7 +246,8 @@ func Router(cfg *Config) *gin.Engine {
 
 	// Free API endpoint, Consistent with the official API format
 	r.POST("/v2/translate", authMiddleware(cfg), func(c *gin.Context) {
-		proxyURL := cfg.Proxy
+		// Bug fix: use the resolved proxyURL from outer Router scope
+		// (previously re-declared as cfg.Proxy, shadowing env-var proxy)
 
 		var translateText string
 		var targetLang string
