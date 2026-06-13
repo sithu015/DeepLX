@@ -41,7 +41,7 @@ If you have a paid DeepL Pro subscription, you can configure DeepLX to run trans
 ### 1. Retrieve your OAuth Access Token
 1. Log in to your paid DeepL Pro account on a web browser.
 2. Open your browser's Developer Tools (F12) -> Application/Storage tab.
-3. Locate the Cookie values under `www.deepl.com` and find the value of the `dl_session` cookie (an OAuth JWT token starting with `eyJ...`).
+3. Locate the Cookie values under `www.deepl.com` and find the value of the `dl_access` cookie (an OAuth JWT token starting with `eyJ...`).
 
 ### 2. Start DeepLX with Pro Credentials
 Configure the server with the `DL_SESSION` environment variable or the `-s` flag:
@@ -64,6 +64,75 @@ curl -i -X POST http://localhost:1188/v1/translate \
     "target_lang": "ES"
   }'
 ```
+
+---
+
+## How to Decrypt and Extract the dl_access Session Cookie on macOS
+
+On macOS, Google Chrome encrypts its SQLite cookie database using a key stored in the macOS Keychain. You can extract the `dl_access` token programmatically using the following steps:
+
+### 1. Retrieve the Chrome Safe Storage Password
+Run the following command in your terminal to extract the raw encryption password from the Keychain:
+```bash
+security find-generic-password -w -s "Chrome Safe Storage"
+```
+
+### 2. Decrypt the Cookie with Python
+Use the password (e.g. `YBeMNd2hq3/kAd1F6+bNrg==`) in the following Python script to copy, query, and decrypt the `dl_access` token:
+```python
+import sqlite3
+import os
+import hashlib
+import subprocess
+import binascii
+
+# Derived from keychain query
+password = b"YBeMNd2hq3/kAd1F6+bNrg=="
+salt = b"saltysalt"
+iterations = 1003
+key = hashlib.pbkdf2_hmac('sha1', password, salt, iterations, dklen=16)
+
+def decrypt_openssl(ciphertext, key_bytes):
+    iv_hex = "20202020202020202020202020202020"
+    key_hex = binascii.hexlify(key_bytes).decode()
+    proc = subprocess.Popen(
+        ['openssl', 'enc', '-d', '-aes-128-cbc', '-K', key_hex, '-iv', iv_hex, '-nosalt'],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    stdout, _ = proc.communicate(input=ciphertext)
+    if proc.returncode == 0:
+        decrypted = stdout
+        if len(decrypted) > 0:
+            padding_len = decrypted[-1]
+            if padding_len < 16:
+                decrypted = decrypted[:-padding_len]
+        return decrypted
+    return b""
+
+# Copy to avoid SQLite lock
+cookies_path = os.path.expanduser("~/Library/Application Support/Google/Chrome/Default/Cookies")
+temp_db_path = "/tmp/cookies_temp.db"
+import shutil
+shutil.copyfile(cookies_path, temp_db_path)
+
+conn = sqlite3.connect(temp_db_path)
+cursor = conn.cursor()
+cursor.execute("SELECT name, encrypted_value FROM cookies WHERE name='dl_access' LIMIT 1")
+row = cursor.fetchone()
+if row:
+    name, enc_val = row
+    decrypted_bytes = decrypt_openssl(enc_val[3:], key)
+    # The first 32 bytes are a signature/header; the rest is the plain-text JWT token.
+    token = decrypted_bytes[32:].decode('utf-8', errors='ignore')
+    print("dl_access token:", token)
+
+conn.close()
+os.remove(temp_db_path)
+```
+You can save this decrypted token directly into your Dokploy environment variables under `DL_SESSION` to enable Pro features.
+
+---
+
 
 ---
 

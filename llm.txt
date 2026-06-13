@@ -102,14 +102,15 @@ Free-tier translation endpoint. Requires `Authorization` header if `TOKEN` is se
 ---
 
 ### 3. POST `/v1/translate`
-Pro-tier translation endpoint. Requires valid DeepL OAuth Pro access token (`dl_session`).
+Pro-tier translation endpoint. Requires a valid DeepL OAuth Pro access token (extracted from the browser's `dl_access` cookie and set via the `DL_SESSION` env var or passed directly).
 - **Fingerprint Limit**: Unlimited.
 - **Request Headers**:
   - `Content-Type: application/json`
   - `Authorization: Bearer <TOKEN>` (Optional, if DeepLX proxy auth token is set)
-  - `Cookie: dl_session=<PRO_OAUTH_TOKEN>` (Alternatively passes session token via cookies)
+  - `Cookie: dl_access=<PRO_OAUTH_TOKEN>` (Alternatively passes session token via cookies)
 - **Request Body**: Same as `/translate`.
 - **Response**: Same as `/translate` with `method: "Pro"`.
+
 
 ---
 
