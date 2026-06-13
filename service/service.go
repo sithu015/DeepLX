@@ -29,8 +29,6 @@ import (
 func authMiddleware(cfg *Config) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if cfg.Token != "" {
-			// Security fix: only accept token via Authorization header (not query string)
-			// Query string tokens are logged in plain text by proxies, CDNs, and web servers.
 			providedToken := c.GetHeader("Authorization")
 
 			// Compatibility with the Bearer token format
@@ -45,6 +43,19 @@ func authMiddleware(cfg *Config) gin.HandlerFunc {
 				} else {
 					providedToken = ""
 				}
+			}
+
+			// Fallback: check query parameters (Approach A)
+			if providedToken == "" {
+				providedToken = c.Query("token")
+				if providedToken == "" {
+					providedToken = c.Query("key")
+				}
+			}
+
+			// Fallback: check path parameter (Approach B)
+			if providedToken == "" {
+				providedToken = c.Param("token")
 			}
 
 			// Security fix: use constant-time comparison to prevent timing side-channel attacks
@@ -99,8 +110,8 @@ func Router(cfg *Config) *gin.Engine {
 		})
 	})
 
-	// Free API endpoint, No Pro Account required
-	r.POST("/translate", authMiddleware(cfg), func(c *gin.Context) {
+	// Free translation handler logic
+	freeHandler := func(c *gin.Context) {
 		req := PayloadFree{}
 		if err := c.BindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
@@ -114,9 +125,6 @@ func Router(cfg *Config) *gin.Engine {
 		targetLang := req.TargetLang
 		translateText := req.TransText
 		tagHandling := req.TagHandling
-
-		// Bug fix: use the resolved proxyURL from outer Router scope
-		// (previously re-declared as cfg.Proxy, shadowing env-var proxy)
 
 		if tagHandling != "" && tagHandling != "html" && tagHandling != "xml" {
 			c.JSON(http.StatusBadRequest, gin.H{
@@ -151,12 +159,15 @@ func Router(cfg *Config) *gin.Engine {
 				"code":    result.Code,
 				"message": result.Message,
 			})
-
 		}
-	})
+	}
 
-	// Pro API endpoint, Pro Account required
-	r.POST("/v1/translate", authMiddleware(cfg), func(c *gin.Context) {
+	// Free API endpoints (both standard and path-based fallback for extensions)
+	r.POST("/translate", authMiddleware(cfg), freeHandler)
+	r.POST("/:token/translate", authMiddleware(cfg), freeHandler)
+
+	// Pro translation handler logic
+	proHandler := func(c *gin.Context) {
 		req := PayloadFree{}
 		if err := c.BindJSON(&req); err != nil {
 			c.JSON(http.StatusBadRequest, gin.H{
@@ -170,8 +181,6 @@ func Router(cfg *Config) *gin.Engine {
 		targetLang := req.TargetLang
 		translateText := req.TransText
 		tagHandling := req.TagHandling
-		// Bug fix: use the resolved proxyURL from outer Router scope
-		// (previously re-declared as cfg.Proxy, shadowing env-var proxy)
 
 		dlSession := cfg.DlSession
 
@@ -195,11 +204,6 @@ func Router(cfg *Config) *gin.Engine {
 			})
 			return
 		}
-		// Bug fix: removed incorrect dot-check that blocked legitimate Pro OAuth JWT tokens.
-		// JWT/OAuth access tokens always contain dots (header.payload.signature),
-		// so the previous check rejected every valid Pro account token.
-		// The Pro endpoint naturally requires a valid token — DeepL's server
-		// will return 401 if the token is not a genuine Pro OAuth token.
 
 		result, err := translate.TranslateByDeepLX(c.Request.Context(), sourceLang, targetLang, translateText, tagHandling, proxyURL, dlSession)
 		if err != nil {
@@ -226,15 +230,15 @@ func Router(cfg *Config) *gin.Engine {
 				"code":    result.Code,
 				"message": result.Message,
 			})
-
 		}
-	})
+	}
+
+	// Pro API endpoints (both standard and path-based fallback for extensions)
+	r.POST("/v1/translate", authMiddleware(cfg), proHandler)
+	r.POST("/v1/:token/translate", authMiddleware(cfg), proHandler)
 
 	// Free API endpoint, Consistent with the official API format
 	r.POST("/v2/translate", authMiddleware(cfg), func(c *gin.Context) {
-		// Bug fix: use the resolved proxyURL from outer Router scope
-		// (previously re-declared as cfg.Proxy, shadowing env-var proxy)
-
 		var translateText string
 		var targetLang string
 
